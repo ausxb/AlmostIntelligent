@@ -1,21 +1,30 @@
 module FFNN (
-        Layer, iteration, checkLayers,
-        sigma, dfSigma, actv, dfActv
+        Layer(..), iteration, checkLayers,
+        sigma, dfSigma, actv, dfActv,
+        initWeights, xavier
     ) where
 
 import Numeric.LinearAlgebra
 import Numeric.LinearAlgebra.Data
-import Control.Monad.State.Strict 
+import Control.Monad
+import Control.Monad.State.Strict
+
+import System.Random.MWC
+import Statistics.Distribution
+import Statistics.Distribution.Normal
 
 import Prelude (
-        map, foldl, foldl1, uncurry, zip, head,
-        Floating, Int, exp, fromIntegral, (+), (-),
-        (/), (*), ($), (.), (==), (>), (<), (&&)
+        IO, Floating, Int,
+        map, foldl, foldl1, uncurry, mapM, zip, head, repeat,
+        exp, fromIntegral, sqrt, (+), (-), (/), (*),
+        ($), (.), (==), (>), (<), (&&)
     )
 
 data Layer = Layer {
     w :: Matrix R,
     b :: Vector R
+    -- , actv :: (Floating t, Container c t) => c t -> c t
+    -- , dfActv :: (Floating t, Container c t) => c t -> c t
 }
 
 type FwdAcc = [(Matrix R, Matrix R, Layer)]
@@ -26,8 +35,16 @@ sigma z = e/(e + 1)
     where e = exp z
           
 dfSigma :: Floating t => t -> t
-dfSigma x = c * (1 - c)
-    where c = sigma x
+dfSigma z = c * (1 - c)
+    where c = sigma z
+
+tanh :: Floating t => t -> t
+tanh z = (e - 1)/(e + 1)
+    where e = exp (2 * z)
+
+dfTanh :: Floating t => t -> t
+dfTanh z = 1 - c * c
+    where c = tanh z
 
 -- Sigmoid activation, generalized so it applies to
 -- matrices of input batches, as is dfActv.
@@ -102,3 +119,27 @@ checkLayers :: [Layer] -> Int
 checkLayers list = foldl (\i l -> if i > 0 && i == (cols (w l))
                        then rows (w l) else 0) init list
     where init = rows . w . head $ list
+    
+xavier :: (Int, Int) -> (Int, Int, NormalDistribution)
+xavier (m, n) = (m, n, d)
+    where d = normalDistr 0.0 (sqrt (1 / fromIntegral n))
+
+genWeights :: ContGen d => GenIO -> (Int, Int, d) -> IO Layer
+genWeights r (m, n, contDist) = randW >>= \rW -> 
+                                    return Layer{ w = (m >< n) rW,
+                                                  b = bZero }
+    where randW = replicateM (m * n) (genContVar contDist r)
+          bZero = m |> repeat 0.0
+
+-- Each pair (m, n) of ints represents an m x n weight matrix
+-- at the corresponding layer
+initWeights :: ContGen d => ((Int, Int) -> (Int, Int, d)) -> GenIO
+                                 -> [(Int, Int)] -> IO [Layer]
+initWeights method rgen = mapM (genWeights rgen) . map method
+
+-- Change so that each layer has its own activation and initialization
+-- type NonLinear = (Floating t, Container c t) => c t -> c t
+-- Layer { actv = cmap (NonLinear) ... }
+--initWeights rand [(10, 25, tanh, xavier),
+--                  (10, 10, tanh, xavier),
+--                  (5, 10, tanh, xavier)]
