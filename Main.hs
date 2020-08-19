@@ -2,16 +2,28 @@ module Main where
 
 import FFNN
 import System.Random.MWC
+import Control.Monad
 import Data.Vector (singleton)
 import Data.Word (Word32)
 
 -- Testing random initialization
 main :: IO ()
 main = do
-    let arch = [(10, 10), (5, 10)]
-    --gen <- (initialize (singleton 94))
+    let spec = [Spec { m = 10, n = 10,
+                       fn = FFNN.tanh,
+                       dfn = dfTanh,
+                       winit = xavier },
+                Spec { m = 5, n = 10,
+                       fn = FFNN.tanh,
+                       dfn = dfTanh,
+                       winit = xavier }]
+    let badDims = checkLayers spec == 0
+    when badDims (putStrLn
+        "Mismatch in layer dimensions")
+    guard $ not badDims
+    -- gen <- initialize (singleton 94)
     gen <- createSystemRandom
-    net <- initWeights xavier gen arch
+    net <- makeLayers gen spec
     mapM printLayer (zip [1..] net)
     return ()
     

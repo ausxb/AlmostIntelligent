@@ -1,7 +1,8 @@
 module FFNN (
-        Layer(..), iteration, checkLayers,
-        sigma, dfSigma, actv, dfActv,
-        initWeights, xavier
+        Layer(..), Spec(..),
+        iteration, checkLayers,
+        sigma, dfSigma, tanh, dfTanh,
+        xavier, makeLayers
     ) where
 
 import Numeric.LinearAlgebra
@@ -15,16 +16,38 @@ import Statistics.Distribution.Normal
 
 import Prelude (
         IO, Floating, Int,
-        map, foldl, foldl1, uncurry, mapM, zip, head, repeat,
-        exp, fromIntegral, sqrt, (+), (-), (/), (*),
+        map, foldl, foldl1, mapM, zip, head, repeat,
+        uncurry, snd, exp, fromIntegral, sqrt,
+        (+), (-), (/), (*),
         ($), (.), (==), (>), (<), (&&)
     )
 
+-- A structure containing needed components for the 
+-- forward and backward passes below.
+-- dfActv is the "gradient" of vectorized activation function.
+-- It is a column vector instead of a true Jacobian and is
+-- intended for use with the Hadamard product.
 data Layer = Layer {
-    w :: Matrix R,
-    b :: Vector R
-    -- , actv :: (Floating t, Container c t) => c t -> c t
-    -- , dfActv :: (Floating t, Container c t) => c t -> c t
+    w      :: Matrix R,
+    b      :: Vector R,
+    actv   :: Matrix R -> Matrix R,
+    dfActv :: Matrix R -> Matrix R
+}
+
+-- Provides a specification for each layer to be constructed.
+-- m is the output dimension, n is the input dimension
+-- fn is the activation function, dfn is the derivative of fn
+-- winit is the weight initialization method. winit takes in the
+-- layer dimensions and must produce an instance of ContGen,
+-- a continuous distribution. Note that fn and dfn are scalar
+-- valued functions that are then "vectorized" with cmap
+-- during layer construction.
+data Spec d = Spec {
+    m     :: Int,
+    n     :: Int,
+    fn    :: R -> R,
+    dfn   :: R -> R,
+    winit :: Int -> Int -> d
 }
 
 type FwdAcc = [(Matrix R, Matrix R, Layer)]
@@ -46,16 +69,6 @@ dfTanh :: Floating t => t -> t
 dfTanh z = 1 - c * c
     where c = tanh z
 
--- Sigmoid activation, generalized so it applies to
--- matrices of input batches, as is dfActv.
-actv :: (Floating t, Container c t) => c t -> c t
-actv = cmap sigma
-
--- "Gradient" of vectorized sigmoid. Column vector form,
--- instead of true Jacobian. Use with Hadamard product.
-dfActv :: (Floating t, Container c t) => c t -> c t
-dfActv = cmap dfSigma
-
 sumColumns :: Matrix R -> Vector R
 sumColumns = foldl1 (+) . toColumns
 
@@ -76,7 +89,7 @@ advanceLayer l = \acc -> state ( \x ->
                     -- add _b to every column
                     let z = fromColumns $ map (+ _b)
                             $ toColumns (_W <> x)
-                    in ((z, x, l) : acc, actv z) )
+                    in ((z, x, l) : acc, actv l $ z) )
     where _W = w l
           _b = b l
 
@@ -94,7 +107,7 @@ forwardPass = foldl (>>=) (state $ \x -> ([], x)) . map advanceLayer
 updateLayer :: R -> (Matrix R, Matrix R, Layer)
                  -> (BackAcc -> State (Matrix R) BackAcc)
 updateLayer eta (z, x, l) = \acc -> state (
-        \bp -> let dz = bp * dfActv z
+        \bp -> let dz = bp * (dfActv l $ z)
                    _W = (-) (w l) $ cmap (* eta) $ stackOuter dz x
                    _b = (-) (b l) $ cmap (* eta) $ sumColumns dz
                    bp' = tr (w l) <> dz
@@ -105,41 +118,45 @@ updateLayer eta (z, x, l) = \acc -> state (
 backwardPass :: R -> FwdAcc -> State (Matrix R) BackAcc
 backwardPass eta = foldl (>>=) (state $ \x -> ([], x)) . map (updateLayer eta)
 
--- The learning rate is divided by the number of training examples here,
--- instead of in backwardPass, to simplify the implementation of backwardPass.
-iteration :: Matrix R -> Matrix R -> R -> [Layer] -> [Layer]
-iteration y x eta nn = updated
+-- Performs forward and backward pass over a batch. A learning rate and
+-- gradient of a cost function is required. For averaging cost, the
+-- scaling factor should be precomputed into the learning rate or 
+-- be part of the cost gradient. The cost gradient function should have
+-- the target data "baked in" so that it takes as its only argument the
+-- activation from the last layer (network output).
+iteration :: Matrix R -> R -> (Matrix R -> Matrix R) -> [Layer] -> [Layer]
+iteration x eta dfCost nn = updated
     where fwdProp = runState . forwardPass $ nn
           (acc, out) = fwdProp x
-          backProp = runState .
-                        backwardPass (eta / fromIntegral (cols out)) $ acc
-          (updated, _) = backProp (y - out)
+          backProp = runState . backwardPass eta $ acc
+          (updated, _) = backProp $ dfCost out
           
-checkLayers :: [Layer] -> Int
-checkLayers list = foldl (\i l -> if i > 0 && i == (cols (w l))
-                       then rows (w l) else 0) init list
-    where init = rows . w . head $ list
+checkLayers :: [Spec d] -> Int
+checkLayers list = foldl (\i (Spec m n _ _ _) -> if i > 0 && i == n
+                                then m else 0) init list
+    where init = m . head $ list
+
+xavier :: Int -> Int -> NormalDistribution
+xavier m n = normalDistr 0.0 (sqrt (1 / fromIntegral n))
+
+genWeights :: ContGen d => GenIO -> Spec d -> IO (Matrix R)
+genWeights r spec = replicateM (_m * _n) (genContVar distr r) >>=
+                        return . (_m >< _n)
+    where _m = m spec
+          _n = n spec
+          distr = (winit spec) _m _n
+
+-- Currently doesn't use spec
+genBias :: ContGen d => Spec d -> IO (Vector R)
+genBias spec = return $ m spec |> repeat 0.0
+
+constructLayer :: ContGen d => GenIO -> Spec d -> IO Layer
+constructLayer rgen spec = do
+    _W   <- genWeights rgen spec
+    _b   <- genBias spec
+    return Layer { w = _W, b = _b,
+                   actv = cmap $ fn spec,
+                   dfActv = cmap $ dfn spec }
     
-xavier :: (Int, Int) -> (Int, Int, NormalDistribution)
-xavier (m, n) = (m, n, d)
-    where d = normalDistr 0.0 (sqrt (1 / fromIntegral n))
-
-genWeights :: ContGen d => GenIO -> (Int, Int, d) -> IO Layer
-genWeights r (m, n, contDist) = randW >>= \rW -> 
-                                    return Layer{ w = (m >< n) rW,
-                                                  b = bZero }
-    where randW = replicateM (m * n) (genContVar contDist r)
-          bZero = m |> repeat 0.0
-
--- Each pair (m, n) of ints represents an m x n weight matrix
--- at the corresponding layer
-initWeights :: ContGen d => ((Int, Int) -> (Int, Int, d)) -> GenIO
-                                 -> [(Int, Int)] -> IO [Layer]
-initWeights method rgen = mapM (genWeights rgen) . map method
-
--- Change so that each layer has its own activation and initialization
--- type NonLinear = (Floating t, Container c t) => c t -> c t
--- Layer { actv = cmap (NonLinear) ... }
---initWeights rand [(10, 25, tanh, xavier),
---                  (10, 10, tanh, xavier),
---                  (5, 10, tanh, xavier)]
+makeLayers :: ContGen d => GenIO -> [Spec d] -> IO [Layer]
+makeLayers rgen = mapM (constructLayer rgen)
