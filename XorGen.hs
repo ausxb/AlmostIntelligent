@@ -2,6 +2,8 @@ module Main where
 
 import Control.Monad
 import Data.Bits
+import Data.ByteString.Lazy
+import Data.Csv
 import Data.Vector (singleton)
 import System.Environment
 import System.Random.MWC
@@ -10,11 +12,14 @@ type Datum = (Double, Double, Double, Int, Int, Int, Int)
 
 main :: IO ()
 main = do
-    rgen <- initialize (singleton 94)
     args <- getArgs
-    ls <- replicateM (read . head $ args) (genPoint rgen)
-    mapM (print . show) ls
-    return ()
+    let (num : file : _) = args
+    let n = read num
+    rgen <- initialize (Data.Vector.singleton 94)
+    ls <- replicateM n (genPoint rgen)
+    -- mapM (print . show) ls
+    -- return ()
+    Data.ByteString.Lazy.writeFile file (encode ls)
     
 genPoint :: GenIO -> IO Datum
 genPoint g = do
