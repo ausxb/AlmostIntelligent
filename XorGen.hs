@@ -15,7 +15,8 @@ main = do
     args <- getArgs
     let (num : file : _) = args
     let n = read num
-    rgen <- initialize (Data.Vector.singleton 94)
+    -- rgen <- initialize (Data.Vector.singleton 94)
+    rgen <- createSystemRandom
     ls <- replicateM n (genPoint rgen)
     -- mapM (print . show) ls
     -- return ()

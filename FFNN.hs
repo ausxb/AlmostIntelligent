@@ -1,6 +1,6 @@
 module FFNN (
         Layer(..), Spec(..),
-        iteration, checkLayers,
+        iteration, checkLayers, inferBatch,
         sigma, dfSigma, tanh, dfTanh,
         xavier, makeLayers
     ) where
@@ -8,6 +8,7 @@ module FFNN (
 import Numeric.LinearAlgebra
 import Numeric.LinearAlgebra.Data
 import Control.Monad
+import Control.Monad.Primitive
 import Control.Monad.State.Strict
 
 import System.Random.MWC
@@ -86,9 +87,8 @@ stackOuter dz a = foldl1 (+) $ map (uncurry outer) (zip dzcols acols)
 -- a (weighted input, previous activation, layer) triple.
 advanceLayer :: Layer -> (FwdAcc -> State (Matrix R) FwdAcc)
 advanceLayer l = \acc -> state ( \x ->
-                    -- add _b to every column
-                    let z = fromColumns $ map (+ _b)
-                            $ toColumns (_W <> x)
+                    let z = (_W <> x)
+                            + (repmat (asColumn _b) 1 (cols x))
                     in ((z, x, l) : acc, actv l $ z) )
     where _W = w l
           _b = b l
@@ -124,33 +124,43 @@ backwardPass eta = foldl (>>=) (state $ \x -> ([], x)) . map (updateLayer eta)
 -- be part of the cost gradient. The cost gradient function should have
 -- the target data "baked in" so that it takes as its only argument the
 -- activation from the last layer (network output).
-iteration :: Matrix R -> R -> (Matrix R -> Matrix R) -> [Layer] -> [Layer]
-iteration x eta dfCost nn = updated
-    where fwdProp = runState . forwardPass $ nn
+iteration :: R -> (Matrix R -> Matrix R) -> [Layer] -> Matrix R  -> [Layer]
+iteration eta dfCost network x = updated
+    where fwdProp = runState . forwardPass $ network
           (acc, out) = fwdProp x
           backProp = runState . backwardPass eta $ acc
           (updated, _) = backProp $ dfCost out
           
+-- inferSingle :: Vector R -> [Layer] -> Vector R
+          
+inferBatch :: Matrix R -> [Layer] -> Matrix R
+inferBatch = foldl (\ x l -> let _W = w l
+                                 _b = b l
+                             in actv l $ fromColumns $ map (+ _b)
+                                $ toColumns $ _W <> x)
+          
 checkLayers :: [Spec d] -> Int
 checkLayers list = foldl (\i (Spec m n _ _ _) -> if i > 0 && i == n
                                 then m else 0) init list
-    where init = m . head $ list
+    where init = n . head $ list
 
 xavier :: Int -> Int -> NormalDistribution
 xavier m n = normalDistr 0.0 (sqrt (1 / fromIntegral n))
 
-genWeights :: ContGen d => GenIO -> Spec d -> IO (Matrix R)
-genWeights r spec = replicateM (_m * _n) (genContVar distr r) >>=
-                        return . (_m >< _n)
+genWeights :: (ContGen d, PrimMonad m) =>
+              Gen (PrimState m) -> Spec d -> m (Matrix R)
+genWeights r spec = replicateM (_m * _n) (genContVar distr r)
+                    >>= return . (_m >< _n)
     where _m = m spec
           _n = n spec
           distr = (winit spec) _m _n
 
--- Currently doesn't use spec
-genBias :: ContGen d => Spec d -> IO (Vector R)
+-- Currently doesn't use a random generator
+genBias :: (ContGen d, PrimMonad m) => Spec d -> m (Vector R)
 genBias spec = return $ m spec |> repeat 0.0
 
-constructLayer :: ContGen d => GenIO -> Spec d -> IO Layer
+constructLayer :: (ContGen d, PrimMonad m) =>
+                  Gen (PrimState m) -> Spec d -> m Layer
 constructLayer rgen spec = do
     _W   <- genWeights rgen spec
     _b   <- genBias spec
@@ -158,5 +168,6 @@ constructLayer rgen spec = do
                    actv = cmap $ fn spec,
                    dfActv = cmap $ dfn spec }
     
-makeLayers :: ContGen d => GenIO -> [Spec d] -> IO [Layer]
+makeLayers :: (ContGen d, PrimMonad m) =>
+              Gen (PrimState m) -> [Spec d] -> m [Layer]
 makeLayers rgen = mapM (constructLayer rgen)
