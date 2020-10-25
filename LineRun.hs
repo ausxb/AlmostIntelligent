@@ -13,13 +13,19 @@ import System.Random.MWC
 type Datum = (Double, Double, Double)
 
 xor_spec = [Spec { m = 2, n = 2,
-                   fn = FFNN.tanh,
-                   dfn = dfTanh,
-                   winit = xavier },
+                   fn = FFNN.sigma,
+                   dfn = dfSigma,
+                   winit = uniInvRoot },
             Spec { m = 1, n = 2,
-                   fn = FFNN.tanh,
-                   dfn = dfTanh,
-                   winit = xavier }]
+                   fn = FFNN.sigma,
+                   dfn = dfSigma,
+                   winit = uniInvRoot }]
+                   
+training_spec = Trainer {
+                    eta = 0.6, lambda = 0.12,
+                    lossFn = quadLoss,
+                    dfLossFn = dfQuadLoss,
+                    updater = l2Reg }
 
 main :: IO ()
 main = do
@@ -46,20 +52,21 @@ main = do
                 datumFeatures datumTarget train
     
     -- mapM_ printBatch (zip [1..] batches)
-    trainNetwork 500 batches network
+    trainNetwork 500 training_spec batches network
     
     test_batch <- shuffleSplit gen 1000
                     datumFeatures datumTarget test
-    testBinaryClassifier (head test_batch) True network
+    testBinaryClassifier (head test_batch) compareBinary
+                         True network
     
     return ()
 
 
 datumFeatures :: Datum -> Vector R
-datumFeatures (x,y,a) = fromList [x,y]
+datumFeatures (x,y,_) = fromList [x,y]
 
 datumTarget :: Datum -> Vector R
-datumTarget (x,y,a) = fromList [a]
+datumTarget (_,_,a) = fromList [a]
                             
 loadCsv :: String -> IO (Vec.Vector Datum)
 loadCsv file = do

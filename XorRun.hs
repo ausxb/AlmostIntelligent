@@ -26,6 +26,12 @@ xor_spec = [Spec { m = 9, n = 3,
                    dfn = dfSigma,
                    winit = uniInvRoot }]
 
+training_spec = Trainer {
+                    eta = 0.6, lambda = 0.0,
+                    lossFn = quadLoss,
+                    dfLossFn = dfQuadLoss,
+                    updater = plainGrad }
+
 main :: IO ()
 main = do
     args <- getArgs
@@ -51,7 +57,7 @@ main = do
                 datumFeatures datumTarget train
     
     -- mapM_ printBatch (zip [1..] batches)
-    trainNetwork 1 batches network
+    trainNetwork 1 training_spec batches network
     
     test_batch <- shuffleSplit gen 1000
                     datumFeatures datumTarget test
@@ -61,10 +67,10 @@ main = do
     return ()
 
 datumFeatures :: Datum -> Vector R
-datumFeatures (x,y,z,a,b,c,d) = fromList [x,y,z]
+datumFeatures (x,y,z,_,_,_,_) = fromList [x,y,z]
 
 datumTarget :: Datum -> Vector R
-datumTarget (x,y,z,a,b,c,d) = fromList [a,b,c,d]
+datumTarget (_,_,_,a,b,c,d) = fromList [a,b,c,d]
 
 loadCsv :: String -> IO (Vec.Vector Datum)
 loadCsv file = do

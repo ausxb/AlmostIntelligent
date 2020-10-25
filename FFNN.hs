@@ -1,18 +1,19 @@
 module FFNN (
-        Layer(..), Spec(..),
+        Layer(..), Spec(..), Trainer(..),
         sigma, dfSigma, tanh, dfTanh,
         xEntropyLoss, dfXEntropyLoss,
         quadLoss, dfQuadLoss,
         xavier, uniInvRoot, makeLayers,
         iteration, checkLayers,
+        plainGrad, l1Reg, l2Reg,
         inferBatch, trainNetwork,
         testBinaryClassifier, testUsingComparator,
-        compareBinary, compareByMax, shuffleSplit,
+        compareBinary, compareByMax,
+        compareBinaryTanh, shuffleSplit,
         printLayer, printBatch
     ) where
 
 import Numeric.LinearAlgebra
-import Numeric.LinearAlgebra.Data
 import Control.Monad
 import Control.Monad.Primitive
 import Control.Monad.State.Strict
@@ -34,10 +35,10 @@ import Text.Printf
 import Prelude (
         IO, Floating, Int, Bool,
         map, foldl, foldl1, mapM,
-        zip, unzip, repeat, head, 
-        snd, uncurry,
-        fromIntegral, print, putChar,
-        sum, sqrt, log, exp,
+        zip, unzip, repeat, head,
+        uncurry, print, putChar,
+        fromIntegral, signum,
+        sum, sqrt, log, exp, 
         (+), (-), (/), (*),
         ($), (.), (==), (>), (<), (&&)
     )
@@ -68,6 +69,21 @@ data Spec d = Spec {
     fn    :: R -> R,
     dfn   :: R -> R,
     winit :: Int -> Int -> d
+}
+
+-- Wraps hyperparameters and other pieces so that network training
+-- is configurable.
+-- eta is the global learning rate
+-- lambda is the regularization rate
+-- lossFn is the loss function, dfLossFn is the derivative of lossFn
+-- updater is a regularization method
+data Trainer = Trainer {
+    eta      :: R,
+    lambda   :: R,
+    lossFn   :: Matrix R -> Matrix R -> R,
+    dfLossFn :: Matrix R -> Matrix R -> Matrix R,
+    updater  :: Trainer -> Matrix R
+                -> Matrix R -> Matrix R
 }
 
 type FwdAcc  = [(Matrix R, Matrix R, Layer)]
@@ -107,7 +123,7 @@ instance Metrics BinaryMetrics where
 sigma :: Floating t => t -> t
 sigma z = e/(e + 1)
     where e = exp z
-          
+
 dfSigma :: Floating t => t -> t
 dfSigma z = c * (1 - c)
     where c = sigma z
@@ -119,7 +135,7 @@ tanh z = (e - 1)/(e + 1)
 dfTanh :: Floating t => t -> t
 dfTanh z = 1 - c * c
     where c = tanh z
-          
+ 
 xEntropyLoss :: Matrix R -> Matrix R -> R
 xEntropyLoss y a = (sumElements ((y * ln_a)
                         + (not_y * ln_not_a)))
@@ -132,11 +148,6 @@ xEntropyLoss y a = (sumElements ((y * ln_a)
 dfXEntropyLoss :: Matrix R -> Matrix R -> Matrix R
 dfXEntropyLoss y s = cmap (/ fromIntegral (cols y))
                           ((s - y) / (s * (cmap (1 -) s)))
-{-    repmat cxe 1 (cols y)
-    where cxe = asColumn
-                $ cmap (/ fromIntegral (cols y))
-                $ sumColumns
-                $ (s - y) / (s * (cmap (1 -) s)) -}
 
 quadLoss :: Matrix R -> Matrix R -> R
 quadLoss y a = (sum (map normsq diffs)) / (2 * n)
@@ -157,6 +168,19 @@ sumRows = foldl1 (+) . toRows
 
 
 {---------------- Network Training ----------------}
+
+plainGrad :: Trainer -> Matrix R -> Matrix R -> Matrix R
+plainGrad trn _W grad = _W - cmap (* (eta trn)) grad
+
+l2Reg :: Trainer -> Matrix R -> Matrix R -> Matrix R
+l2Reg trn _W grad = cmap (* factor) _W - cmap (* (eta trn)) grad
+    where factor = (1 - (eta trn) * (lambda trn))
+
+l1Reg :: Trainer -> Matrix R -> Matrix R -> Matrix R
+l1Reg trn _W grad = _W - signFactor _W - cmap (* (eta trn)) grad
+    where signFactor = cmap ((* (lambda trn)) . signum)
+
+--dropout :: Trainer -> Matrix R -> Matrix R -> Matrix R
 
 -- Take outer products of corresponding columns and adds the results.
 -- Let U = [u_1 u_2 ... u_n] and V = [v_1 v_2 ... v_n] where
@@ -189,19 +213,20 @@ forwardPass = foldl (>>=) (state $ \x -> ([], x)) . map advanceLayer
 -- layer using the stored matrix of weighted inputs from the batch.
 -- The gradients are then multiplied by the tranpose of the weight
 -- matrix and backpropagated to the next state processor.
-updateLayer :: R -> (Matrix R, Matrix R, Layer)
+updateLayer :: Trainer -> (Matrix R, Matrix R, Layer)
                  -> (BackAcc -> State (Matrix R) BackAcc)
-updateLayer eta (z, x, l) = \acc -> state (
+updateLayer trn (z, x, l) = \acc -> state (
         \bp -> let dz = bp * (dfActv l $ z)
-                   _W = (-) (w l) $ cmap (* eta) $ stackOuter dz x
-                   _b = (-) (b l) $ cmap (* eta) $ sumColumns dz
+                   _W = (updater trn) trn (w l) (stackOuter dz x)
+                   _b = (-) (b l) $ cmap (* (eta trn)) $ sumColumns dz
                    bp' = tr (w l) <> dz
                in (l{ w = _W, b = _b } : acc, bp') )
 
 -- The reversed list from the forward pass is reversed again, yielding
 -- an updated list of layers in the original order.
-backwardPass :: R -> FwdAcc -> State (Matrix R) BackAcc
-backwardPass eta = foldl (>>=) (state $ \x -> ([], x)) . map (updateLayer eta)
+backwardPass :: Trainer -> FwdAcc -> State (Matrix R) BackAcc
+backwardPass trn = foldl (>>=) (state $ \x -> ([], x))
+                   . map (updateLayer trn)
 
 -- Performs forward and backward pass over a batch. A learning rate and
 -- gradient of a cost function is required. For averaging cost, the
@@ -209,12 +234,12 @@ backwardPass eta = foldl (>>=) (state $ \x -> ([], x)) . map (updateLayer eta)
 -- function also must have the target data "baked in" (such as by partial
 -- function application) so that it takes as its only argument the
 -- activation from the last layer (network output).
-iteration :: R -> (Matrix R -> Matrix R) -> [Layer] -> Matrix R  -> [Layer]
-iteration eta dfCost network x = updated
-    where fwdProp = runState . forwardPass $ network
+iteration :: Trainer -> [Layer] -> (Matrix R, Matrix R) -> [Layer]
+iteration trn network (x, y) = updated
+    where fwdProp = runState $ forwardPass network
           (acc, out) = fwdProp x
-          backProp = runState . backwardPass eta $ acc
-          (updated, _) = backProp $ dfCost out
+          backProp = runState $ backwardPass trn acc
+          (updated, _) = backProp $ (dfLossFn trn) y out
 
 
 
@@ -269,40 +294,42 @@ checkLayers list = foldl (\i (Spec m n _ _ _) -> if i > 0 && i == n
                                 then m else 0) init list
     where init = n . head $ list
 
-trainNetwork :: Int -> [(Matrix R, Matrix R)]
+trainNetwork :: Int -> Trainer
+                -> [(Matrix R, Matrix R)]
                 -> [Layer] -> IO [Layer]
-trainNetwork i batches network = runTraining
-                    i 1 batches network
+trainNetwork i trn batches network = runTraining
+                    i 1 trn batches network
 
-runTraining :: Int -> Int -> [(Matrix R, Matrix R)]
-              -> [Layer] -> IO [Layer]
-runTraining i c batches network =
+runTraining :: Int -> Int -> Trainer
+               -> [(Matrix R, Matrix R)]
+               -> [Layer] -> IO [Layer]
+runTraining i c trn batches network =
     if c > i then
         return network
     else
-        runEpochWithOutput c 0.1 -- (1 / (sqrt $ fromIntegral c))
+        runEpochWithOutput c trn
                             network batches
-        >>= runTraining i (c + 1) batches
+        >>= runTraining i (c + 1) trn batches
 
-runEpochWithOutput :: Int -> R -> [Layer]
+runEpochWithOutput :: Int -> Trainer -> [Layer]
                       -> [(Matrix R, Matrix R)]
                       -> IO [Layer]
-runEpochWithOutput i eta network batches = do
+runEpochWithOutput i trn network batches = do
     printf "====Epoch %d====\n" i
     result <- foldM applyEnum network (zip [1..] batches)
     printf "Network after epoch %d\n" i
     mapM_ printLayer (zip [1..] result)
     return result
     where applyEnum net (i, b) =
-            runBatchWithOutput i eta net b
+            runBatchWithOutput i trn net b
 
-runBatchWithOutput :: Int -> R -> [Layer]
+runBatchWithOutput :: Int -> Trainer
+                      -> [Layer]
                       -> (Matrix R, Matrix R)
                       -> IO [Layer]
-runBatchWithOutput i eta network (x, y) = do
-    let result = iteration eta
-          (dfQuadLoss y) network x
-    let loss = quadLoss y (inferBatch result x)
+runBatchWithOutput i trn network pair@(x, y) = do
+    let result = iteration trn network pair
+    let loss = (lossFn trn) y (inferBatch result x)
     printf "batch %d loss: %f\n" i loss
     return result
 
@@ -311,6 +338,13 @@ runBatchWithOutput i eta network (x, y) = do
 compareBinary :: Comparator
 compareBinary res ans = ans == val
     where val = if (maxElement res) > 0.5
+                then 1 else 0
+
+-- Since the vector has only one element, that's
+-- the one returned by maxElement
+compareBinaryTanh :: Comparator
+compareBinaryTanh res ans = ans == val
+    where val = if (maxElement res) > 0.0
                 then 1 else 0
 
 compareByMax :: Comparator
@@ -325,12 +359,12 @@ processResults :: Metrics m => Comparator
                   -> Bool -> Counter m -> m -> IO m
 processResults _ [] [] [] _ _ metrics = return metrics
 processResults comp (ex:examples) (res:results) (ans:answers)
-               outputResults metricsCounter metrics = do
+               outputResults counter metrics = do
     let bool = comp res ans
     when outputResults (printResult bool ex res ans)
     processResults comp examples results answers
-                   outputResults metricsCounter 
-                   (metricsCounter comp res ans metrics)
+                   outputResults counter 
+                   (counter comp res ans metrics)
     where newCount = 1 + count metrics
           printResult b e r a =
               let switchStr = 
@@ -376,12 +410,12 @@ updateSimpleMetrics comp res ans mets =
     where ansCorrect = comp res ans
           newCount = 1 + simpleMetricsCount mets
 
-testBinaryClassifier :: (Matrix R, Matrix R) -> Bool
-                        -> [Layer] -> IO ()
-testBinaryClassifier (test, ans) listOutputs network = do
+testBinaryClassifier :: (Matrix R, Matrix R) -> Comparator
+                        -> Bool -> [Layer] -> IO ()
+testBinaryClassifier (test, ans) comp listOutputs network = do
     let results = inferBatch network test
     BinaryMetrics total c_0 w_0 c_1 w_1
-                    <- processResults compareBinary
+                    <- processResults comp
                         (toColumns test)
                         (toColumns results)
                         (toColumns ans)
@@ -399,7 +433,7 @@ testBinaryClassifier (test, ans) listOutputs network = do
 updateBinaryMetrics :: Comparator -> Vector R -> Vector R
                        -> BinaryMetrics -> BinaryMetrics
 updateBinaryMetrics comp res ans mets =
-    if correct then
+    if _correct then
         if binClass then
             mets{binaryMetricsCount = newCount,
                  correct_1 = 1 + correct_1 mets}
@@ -407,13 +441,13 @@ updateBinaryMetrics comp res ans mets =
             mets{binaryMetricsCount = newCount,
                  correct_0 = 1 + correct_0 mets}
     else
-        if binClass then
+        if binClass then -- true 1 but classified as 0
             mets{binaryMetricsCount = newCount,
                  wrong_0 = 1 + wrong_0 mets}
-        else
+        else             -- true 0 but classified as 1
             mets{binaryMetricsCount = newCount,
                  wrong_1 = 1 + wrong_1 mets}
-    where correct = comp res ans
+    where _correct = comp res ans
           binClass = comp ans (scalar 1.0)
           newCount = 1 + binaryMetricsCount mets
 
